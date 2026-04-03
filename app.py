@@ -5,6 +5,7 @@ Placement-ready: OOP data layer, SQLite persistence, error handling, modern UI.
 
 from __future__ import annotations
 
+import html
 import random
 import sqlite3
 from contextlib import contextmanager
@@ -69,9 +70,10 @@ class HabitPrediction:
     habit_id: int
     habit_name: str
     today_pct: float
-    tomorrow_pct: float
-    explanation: str
-    warn_low: bool
+    risk_level: str  # "Low" | "Medium" | "High"
+    risk_emoji: str
+    insight: str
+    tip: str
 
 
 # ---------------------------------------------------------------------------
@@ -465,49 +467,130 @@ class HabitTracker:
         jitter = random.uniform(-5.0, 5.0)
         return max(0.0, min(100.0, base_pct + jitter))
 
+    def _missed_days_last_7(self, habit_id: int, end: date) -> int:
+        """Count eligible days in the 7-day window ending `end` with no completion log."""
+        created = self._habit_created_date(habit_id)
+        start = end - timedelta(days=6)
+        missed = 0
+        d = start
+        while d <= end:
+            if d >= created and not self.is_done_on(habit_id, d):
+                missed += 1
+            d += timedelta(days=1)
+        return missed
+
     @staticmethod
-    def _prediction_explanation(
+    def _classify_risk(
+        done_today: bool,
+        today_pct_noisy: float,
+        consistency_7: float,
+        streak_days: int,
+        missed_last_7: int,
+    ) -> tuple[str, str]:
+        """
+        Habit Insights & Risk Alert — discrete risk level from signals + noisy probability.
+
+        Uses:
+        - **done_today**: if True, slip risk for *today* is resolved → Low.
+        - **today_pct_noisy**: post-noise completion probability (primary gauge).
+        - **consistency_7**: share of last 7 days completed (0–1); low values raise risk.
+        - **streak_days**: longer trailing streak lowers risk when paired with decent consistency.
+        - **missed_last_7**: raw count of non-completed eligible days in the window; more misses → higher risk.
+
+        Rules (tuned for clear UX):
+        - **High**: weak probability, very weak week, or many misses.
+        - **Low**: strong probability + tolerable misses, or already done today.
+        - **Medium**: everything in between.
+        """
+        if done_today:
+            return "Low", "🟢"
+        if today_pct_noisy < 48.0 or consistency_7 <= (2.0 / 7.0) or missed_last_7 >= 4:
+            return "High", "🔴"
+        if (
+            today_pct_noisy >= 72.0
+            and consistency_7 >= (4.0 / 7.0)
+            and missed_last_7 <= 1
+        ):
+            return "Low", "🟢"
+        if (
+            today_pct_noisy >= 60.0
+            and consistency_7 >= (5.0 / 7.0)
+            and missed_last_7 <= 2
+            and streak_days >= 3
+        ):
+            return "Low", "🟢"
+        if today_pct_noisy < 58.0 or missed_last_7 >= 3:
+            return "High", "🔴"
+        return "Medium", "🟠"
+
+    @staticmethod
+    def _personalized_insight(
+        habit_name: str,
+        done_today: bool,
         streak_days: int,
         consistency_7: float,
-        overall_rate: float,
-        done_today: bool,
+        missed_last_7: int,
     ) -> str:
-        """Short, motivating copy from signal strength (not the noisy percentage)."""
+        """One line tailored to streak + 7-day pattern (not the random % jitter)."""
         if done_today:
-            return "Nailed today — carry that energy into tomorrow. ✨"
-        if consistency_7 >= 6 / 7 and streak_days >= 5:
-            return "Strong 7-day consistency — you're building real momentum. 🔥"
-        if streak_days >= 10:
-            return "Long unbroken run — this habit is sticking. 🌿"
-        if consistency_7 <= 2 / 7:
-            return "Risk of missing — inconsistent lately; one small win today resets the arc. ⚠️"
-        if overall_rate < 0.4 and streak_days < 3:
-            return "History is mixed — focus on today only; progress beats perfection. 🌱"
-        if streak_days >= 3:
-            return "Decent streak — stay consistent to lock in the habit. ✅"
-        return "Fresh start territory — show up once today to build the chain. 💪"
+            return f"Nice — «{habit_name}» is done for today. Carry this win forward. ✨"
+        if streak_days >= 7 and consistency_7 >= (6.0 / 7.0):
+            return "Strong 7-day streak – you're building momentum! 🔥"
+        if missed_last_7 >= 4:
+            return "Pattern shows several missed days — shrink the habit to 2 minutes and log once. 🎯"
+        if missed_last_7 in (2, 3):
+            return f"You've missed {missed_last_7} days recently – try setting a reminder. ⏰"
+        if streak_days >= 3 and consistency_7 >= (4.0 / 7.0):
+            return "You're showing up more often than not — one more check-in locks the habit. ✅"
+        if streak_days == 0 and consistency_7 < (3.0 / 7.0):
+            return "Fresh runway — one completion today breaks the cold streak. 🌱"
+        return "Small steps beat zero — pick the easiest version of this habit now. 💪"
+
+    @staticmethod
+    def _motivational_tip(
+        habit_name: str,
+        risk_level: str,
+        habit_id: int,
+        today: date,
+    ) -> str:
+        """
+        One actionable tip, stable for the same habit on the same day (deterministic RNG)
+        so the tab doesn't flicker on every Streamlit rerun.
+        """
+        rng = random.Random(habit_id * 100_003 + today.toordinal())
+        low_tips = [
+            "Keep the chain visible — mark {name} right after a fixed daily anchor (breakfast, login, bedtime).",
+            "Protect what works: same time, same cue for {name} this week.",
+            "You're in a groove — write one sentence in a note when you finish {name} to reinforce the win.",
+        ]
+        mid_tips = [
+            "Make {name} stupid-easy: lower the bar to 60 seconds so \"later\" never wins.",
+            "Stack {name} onto something you never skip (shower, first coffee, shoes on).",
+            "If you miss once, show up the next day — never twice in a row for {name}.",
+        ]
+        high_tips = [
+            "Set one phone alarm labeled «{name}» — friction beats forgetting.",
+            "Pre-decide the minimum: e.g. one sip, one page, one minute for {name}.",
+            "Tell someone you'll report {name} tonight — accountability nudges follow-through.",
+            "Remove one distraction before {name} (silent mode, tab closed) — environment shapes behavior.",
+        ]
+        pool = {"Low": low_tips, "Medium": mid_tips, "High": high_tips}[risk_level]
+        template = rng.choice(pool)
+        return template.format(name=habit_name)
 
     def predict_completion_probability(self, habit_id: int) -> HabitPrediction:
         """
-        Estimate completion likelihood for today and tomorrow using habit-specific signals.
+        Today's completion probability plus Habit Insights & Risk Alert (no tomorrow forecast).
 
-        Signals:
-        - Trailing completion streak (longer => higher weight via streak_score).
-        - Last 7 calendar days completion rate for this habit.
-        - Overall historical completion rate since the habit was created.
+        **Probability (before ±5% noise)** uses the same blend as before:
+            0.4 * streak_score + 0.4 * consistency_7day + 0.2 * overall_rate
+        If the habit is already logged today, base probability is 100% (then noise).
 
-        Core formula (before noise), on a 0–100 scale:
-            base = 100 * (
-                0.4 * min(streak/14, 1)
-              + 0.4 * consistency_7day
-              + 0.2 * overall_rate
-            )
+        **Risk level** combines the *noisy* probability with 7-day consistency, streak length,
+        and missed-day count — see `_classify_risk` docstring.
 
-        Small randomness (±5%) is applied separately for today vs tomorrow.
-
-        Today's target: if already completed today, reported today probability is ~100% (with jitter).
-        Tomorrow uses the same structural formula with the window shifted to end on tomorrow
-        (future day counts only past logs inside that window).
+        **Insight** summarizes streak + weekly pattern; **tip** is a single actionable suggestion
+        matched to risk level (deterministic per habit per day).
         """
         today = date.today()
         habits = {h.id: h for h in self.get_all_habits()}
@@ -515,39 +598,37 @@ class HabitTracker:
             raise ValueError(f"No habit with id {habit_id}.")
 
         hrow = habits[habit_id]
+        name = hrow.name
         done_today = self.is_done_on(habit_id, today)
 
         streak_today = self._trailing_completion_streak(habit_id, today)
         c7_today = self._consistency_last_7(habit_id, today)
         overall_today = self._overall_habit_rate(habit_id, today)
+        missed_7 = self._missed_days_last_7(habit_id, today)
 
         if done_today:
             base_today = 100.0
         else:
             base_today = self._base_probability_pct(streak_today, c7_today, overall_today)
 
-        tomorrow = today + timedelta(days=1)
-        streak_tmr = self._trailing_completion_streak(habit_id, tomorrow)
-        c7_tmr = self._consistency_last_7(habit_id, tomorrow)
-        overall_tmr = self._overall_habit_rate(habit_id, today)
-
-        base_tmr = self._base_probability_pct(streak_tmr, c7_tmr, overall_tmr)
-
         today_pct = round(self._apply_prediction_noise(base_today), 1)
-        tomorrow_pct = round(self._apply_prediction_noise(base_tmr), 1)
 
-        explanation = self._prediction_explanation(
-            streak_today, c7_today, overall_today, done_today
+        risk_level, risk_emoji = self._classify_risk(
+            done_today, today_pct, c7_today, streak_today, missed_7
         )
-        warn_low = today_pct < 60.0
+        insight = self._personalized_insight(
+            name, done_today, streak_today, c7_today, missed_7
+        )
+        tip = self._motivational_tip(name, risk_level, habit_id, today)
 
         return HabitPrediction(
             habit_id=habit_id,
-            habit_name=hrow.name,
+            habit_name=name,
             today_pct=today_pct,
-            tomorrow_pct=tomorrow_pct,
-            explanation=explanation,
-            warn_low=warn_low,
+            risk_level=risk_level,
+            risk_emoji=risk_emoji,
+            insight=insight,
+            tip=tip,
         )
 
 
@@ -718,6 +799,23 @@ def inject_custom_css() -> None:
             .pred-bar-fill.pred-low {
                 background: linear-gradient(90deg, #991b1b, #f87171);
             }
+            .risk-pill-low { color: #86efac; font-weight: 700; }
+            .risk-pill-mid { color: #fb923c; font-weight: 700; }
+            .risk-pill-high { color: #f87171; font-weight: 700; }
+            .smart-pred-card .insight-line {
+                color: #cbd5e1;
+                font-size: 0.95rem;
+                margin: 0.5rem 0 0.35rem 0;
+                line-height: 1.5;
+            }
+            .smart-pred-card .tip-line {
+                color: #94a3b8;
+                font-size: 0.88rem;
+                margin: 0.35rem 0 0 0;
+                line-height: 1.45;
+                border-left: 3px solid rgba(34, 197, 94, 0.35);
+                padding-left: 0.75rem;
+            }
         </style>
         """,
         unsafe_allow_html=True,
@@ -766,13 +864,14 @@ def render_weekly_chart(weekly: list[dict[str, Any]]) -> go.Figure:
 # ---------------------------------------------------------------------------
 
 
-# Bump this when HabitTracker gains methods or DB logic changes so Streamlit
-# does not reuse a stale cached instance (fixes AttributeError after edits).
-_TRACKER_CACHE_VERSION = 2
+def get_tracker() -> HabitTracker:
+    """
+    Return a fresh HabitTracker each script run.
 
-
-@st.cache_resource
-def get_tracker(_version: int = _TRACKER_CACHE_VERSION) -> HabitTracker:
+    We intentionally do **not** cache this with @st.cache_resource: Streamlit’s resource
+    cache can keep an old class/instance across edits, so the UI looks like “nothing changed.”
+    Instantiating HabitTracker is cheap (DB opens per query anyway).
+    """
     return HabitTracker(DB_PATH)
 
 
@@ -913,12 +1012,12 @@ def main() -> None:
             )
             st.dataframe(df, width="stretch", hide_index=True)
 
-    # --- Tab: Smart Prediction ----------------------------------------------
+    # --- Tab: Smart Prediction (Habit Insights & Risk Alert) ----------------
     with tab_smart:
-        st.markdown("##### 🧠 Smart Prediction")
+        st.markdown("##### 🧠 Smart Prediction · Habit Insights & Risk Alert")
         st.caption(
-            "Estimates use your **streak**, **last 7 days**, and **history** — "
-            "then a little randomness (±5%) so it feels human, not robotic."
+            "Today's likelihood blends **streak**, **last 7 days**, and **history**, "
+            "with **±5%** jitter. **Risk** layers consistency and missed days on top — not just the %."
         )
         try:
             pred_habits = tracker.get_all_habits()
@@ -927,7 +1026,7 @@ def main() -> None:
             pred_habits = []
 
         if not pred_habits:
-            st.info("Add habits to see personalized completion forecasts. 🌱")
+            st.info("Add habits to see insights and risk alerts. 🌱")
         else:
             for h in pred_habits:
                 try:
@@ -936,31 +1035,37 @@ def main() -> None:
                     st.warning(f"{h.name}: {e}")
                     continue
 
-                warn_icon = " ⚠️" if pr.warn_low else ""
-                bar_class_today = (
-                    "pred-high" if pr.today_pct >= 70 else "pred-mid" if pr.today_pct >= 60 else "pred-low"
-                )
-                bar_class_tmr = (
+                bar_class = (
                     "pred-high"
-                    if pr.tomorrow_pct >= 70
+                    if pr.today_pct >= 70
                     else "pred-mid"
-                    if pr.tomorrow_pct >= 60
+                    if pr.today_pct >= 55
                     else "pred-low"
                 )
+                risk_class = (
+                    "risk-pill-low"
+                    if pr.risk_level == "Low"
+                    else "risk-pill-mid"
+                    if pr.risk_level == "Medium"
+                    else "risk-pill-high"
+                )
+                safe_name = html.escape(pr.habit_name)
+                safe_insight = html.escape(pr.insight)
+                safe_tip = html.escape(pr.tip)
 
                 st.markdown(
                     f"""
                     <div class="smart-pred-card">
-                        <h4>{pr.habit_name}{warn_icon}</h4>
-                        <p class="pred-meta">{pr.explanation}</p>
-                        <div class="pred-row-label">Today · {pr.today_pct:.0f}%</div>
+                        <h4>{safe_name}</h4>
+                        <p class="pred-meta">
+                            <span class="{risk_class}">Risk: {pr.risk_level} {pr.risk_emoji}</span>
+                            · Today's completion · {pr.today_pct:.0f}%
+                        </p>
                         <div class="pred-bar-track">
-                            <div class="pred-bar-fill {bar_class_today}" style="width: {pr.today_pct}%;"></div>
+                            <div class="pred-bar-fill {bar_class}" style="width: {pr.today_pct}%;"></div>
                         </div>
-                        <div class="pred-row-label">Tomorrow · {pr.tomorrow_pct:.0f}%</div>
-                        <div class="pred-bar-track">
-                            <div class="pred-bar-fill {bar_class_tmr}" style="width: {pr.tomorrow_pct}%;"></div>
-                        </div>
+                        <p class="insight-line"><strong>Insight:</strong> {safe_insight}</p>
+                        <p class="tip-line"><strong>Tip:</strong> {safe_tip}</p>
                     </div>
                     """,
                     unsafe_allow_html=True,
